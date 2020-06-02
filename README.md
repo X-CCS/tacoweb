@@ -7,6 +7,13 @@ IMPORTANT NOTE: tacotron2 will cut off if the input text is too
   long, and it doesn't like it when there is no punctuation on
   the end of a short line. so, break long text on multiple lines.
 
+tacoweb wants
+  tacotron2_statedict.pt, md5 4ac2851cbf9ad438581845e5594f591b
+  waveglow_256channels.pt, md5 632fb5cca5b58ab5411e09b3330f76e1
+as well as the tacotron2 repository.
+you can get models from here:
+https://drive.google.com/file/d/15IqJ782OQrDbhMwrd6Ul24zGL60U6XVA/view
+
 ```
 server/tacoweb: the web server.
 

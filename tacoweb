@@ -1,0 +1,140 @@
+#!/home/gibson/sdb2/cola/ass/teacup/anaconda/envs/pose_taco/bin/python
+# tacotron web server
+# tasty taco delivery
+
+import sys
+import os
+import re
+sys.path.append('waveglow/')
+import numpy as np
+import torch
+
+from hparams import create_hparams
+from model import Tacotron2
+from layers import TacotronSTFT, STFT
+from train import load_model
+from text import text_to_sequence
+
+SAMPLE_RATE = 22050
+TACOTRON_PATH = "tacotron2_statedict.pt"
+WAVEGLOW_PATH = "waveglow_256channels.pt"
+
+from http import HTTPStatus
+from http.server import *
+import soundfile
+import io
+import gzip
+import urllib
+
+def wavemaker(b):
+    ff = io.BytesIO()
+    soundfile.write(ff, b.astype(np.float32), samplerate=SAMPLE_RATE, format='wav')
+    return ff.getbuffer()
+
+class substitution:
+    def __init__(self, listfile):
+        self.file = listfile
+        self.time = None
+        self.reload()
+        self.word = re.compile(r'\b([a-zA-Z]+)\b')
+
+    def reload(self):
+        if self.time == os.path.getmtime(self.file):
+            return
+        self.time = os.path.getmtime(self.file)
+        self.substitutions = {}
+        sfil = open(self.file, "r")
+        for line in sfil:
+            try:
+                word, phoneme = line.strip().split("=", 1)
+                word = word.lower()
+                self.substitutions[word] = phoneme
+                print(word, "=", phoneme)
+            except ValueError:
+                print("error parsing line in phonetics file")
+                print(line)
+
+    def replace(self, text):
+        self.reload()
+
+        def replaceoneword(word):
+            return self.substitutions.get(word.group(0).lower(), word.group(0))
+
+        return self.word.sub(replaceoneword, text)
+
+class tacosrv:
+    def __init__(self):
+        hparams = create_hparams()
+        hparams.sampling_rate = 22050
+
+        checkpoint_path = TACOTRON_PATH
+        model = load_model(hparams)
+        model.load_state_dict(
+                torch.load(checkpoint_path)['state_dict'],
+        )
+        model.cuda().eval().half()
+
+        waveglow = torch.load(WAVEGLOW_PATH)['model']
+        waveglow.cuda().eval().half()
+        for mod in waveglow.convinv:
+            mod.float()
+
+        phonetics = substitution("phonetics")
+        def tts(txt):
+            txt = phonetics.replace(txt)
+            print("saying", txt)
+            sequence = np.array(
+                    text_to_sequence(
+                        txt,
+                        ['english_cleaners']
+                    )
+                )[None, :]
+            sequence = torch.autograd.Variable(torch.from_numpy(sequence)) \
+                    .cuda().long()
+            (mel_outputs, mel_outputs_postnet, gate_outputs, alignments) = \
+                    model.inference(sequence)
+            with torch.no_grad():
+                audio = waveglow.infer(mel_outputs_postnet, sigma=0.97)
+            out = self.filter(audio[0].data.cpu().numpy())
+            wave = wavemaker(out)
+            return wave
+
+        from scipy.signal import cheby2
+        from scipy.signal import sosfilt
+
+        sos = cheby2(
+                12, # order of filter
+                40, # decibels of attenuation
+                6000, # low-pass frequency
+                'lowpass',
+                False, # not analog
+                'sos', # output type
+                SAMPLE_RATE # sampling frequency
+            )
+
+        def filter(wave):
+            # try to filter out the whine above 5 kHz
+            return sosfilt(sos, wave)
+
+        self.tts = tts
+
+        self.filter = filter
+
+server = None
+
+class TacoHTTPRequestHandler(BaseHTTPRequestHandler): # atashi iya ne
+    def do_GET(self):
+        query = urllib.parse.urlparse(self.path).query
+        text = urllib.parse.unquote_plus(query)
+        out = server.tts(text)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-type", "audio/x-wav")
+        self.send_header("Content-length", len(out))
+        self.end_headers()
+        self.wfile.write(out)
+        self.wfile.flush()
+
+if __name__ == "__main__":
+    server = tacosrv()
+    httpd = HTTPServer(('', 9997), TacoHTTPRequestHandler)
+    httpd.serve_forever()
